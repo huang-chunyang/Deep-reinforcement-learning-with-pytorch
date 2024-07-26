@@ -61,8 +61,8 @@ class CriticNet(nn.Module):
 
 class Agent():
 
-    clip_param = 0.2
-    max_grad_norm = 0.5
+    clip_param = 0.1
+    max_grad_norm = 0.3
     ppo_epoch = 10
     buffer_capacity, batch_size = 1000, 32
 
@@ -119,7 +119,7 @@ class Agent():
 
         adv = (target_v - self.cnet(s)).detach()
 
-        for _ in range(self.ppo_epoch):
+        for _ in range(self.ppo_epoch): # PPO with clipped objective
             for index in BatchSampler(
                     SubsetRandomSampler(range(self.buffer_capacity)), self.batch_size, False):
 
@@ -148,24 +148,26 @@ class Agent():
 
 
 def main():
-    env = gym.make('Pendulum-v0')
-    env.seed(args.seed)
+    env = gym.make('Pendulum-v1', render_mode="rgb_array")
+    # env.seed(args.seed)
 
     agent = Agent()
 
     training_records = []
     running_reward = -1000
     state = env.reset()
-    for i_ep in range(1000):
+    for i_ep in range(10000):
         score = 0
-        state = env.reset()
+        state, info = env.reset()
 
         for t in range(200):
             action, action_log_prob = agent.select_action(state)
-            state_, reward, done, _ = env.step([action])
+            state_, reward, done, truncated, info = env.step([action]) 
             if args.render:
                 env.render()
-            if agent.store(Transition(state, action, action_log_prob, (reward + 8) / 8, state_)):
+            # if agent.store(Transition(state, action, action_log_prob, (reward + 8) / 8, state_)):
+            if agent.store(Transition(state, action, action_log_prob, reward, state_)):
+                # print('update')
                 agent.update()
             score += reward
             state = state_
