@@ -9,12 +9,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Normal
+from torch.distributions import Normal, Categorical
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 
-parser = argparse.ArgumentParser(description='Solve the Pendulum-v1 with PPO')
+parser = argparse.ArgumentParser(description='Solve the Cartpole-v1 with PPO')
 parser.add_argument(
-    '--gamma', type=float, default=0.9, metavar='G', help='discount factor (default: 0.9)')
+    '--gamma', type=float, default=0.95, metavar='G', help='discount factor (default: 0.9)')
 parser.add_argument('--seed', type=int, default=0, metavar='N', help='random seed (default: 0)')
 parser.add_argument('--render', action='store_true', help='render the environment')
 parser.add_argument(
@@ -35,22 +35,20 @@ class ActorNet(nn.Module):
 
     def __init__(self):
         super(ActorNet, self).__init__()
-        self.fc = nn.Linear(3, 100)
-        self.mu_head = nn.Linear(100, 1)
-        self.sigma_head = nn.Linear(100, 1)
+        self.fc1 = nn.Linear(4, 128)
+        self.fc2 = nn.Linear(128, 2) 
 
     def forward(self, x):
-        x = F.relu(self.fc(x))
-        mu = 2.0 * F.tanh(self.mu_head(x))
-        sigma = F.softplus(self.sigma_head(x))
-        return (mu, sigma)
+        x = F.relu(self.fc1(x))
+        action_probs = F.softmax(self.fc2(x), dim=1)
+        return action_probs
 
 
 class CriticNet(nn.Module):
 
     def __init__(self):
         super(CriticNet, self).__init__()
-        self.fc = nn.Linear(3, 100)
+        self.fc = nn.Linear(4, 100)
         self.v_head = nn.Linear(100, 1)
 
     def forward(self, x):
@@ -64,7 +62,7 @@ class Agent():
     clip_param = 0.1
     max_grad_norm = 0.3
     ppo_epoch = 10
-    buffer_capacity, batch_size = 1000, 32
+    buffer_capacity, batch_size = 500, 32
 
     def __init__(self):
         self.training_step = 0
@@ -79,13 +77,10 @@ class Agent():
     def select_action(self, state):
         state = torch.from_numpy(state).float().unsqueeze(0)
         with torch.no_grad():
-            (mu, sigma) = self.anet(state)
-        dist = Normal(mu, sigma)
+            action_probs = self.anet(state)
+        dist = Categorical(action_probs)
         action = dist.sample()
         action_log_prob = dist.log_prob(action)
-        action = action.clamp(-2.0, 2.0)
-        print(action.item(), action_log_prob.item())
-        assert False
         return action.item(), action_log_prob.item()
 
     def get_value(self, state):
@@ -115,71 +110,82 @@ class Agent():
         old_action_log_probs = torch.tensor(
             [t.a_log_p for t in self.buffer], dtype=torch.float).view(-1, 1)
 
-        r = (r - r.mean()) / (r.std() + 1e-5)
+        # r = (r - r.mean()) / (r.std() + 1e-5)
         with torch.no_grad():
             target_v = r + args.gamma * self.cnet(s_)
 
         adv = (target_v - self.cnet(s)).detach()
 
-        for _ in range(self.ppo_epoch): # PPO with clipped objective
-            for index in BatchSampler(
-                    SubsetRandomSampler(range(self.buffer_capacity)), self.batch_size, False):
+        
+        action_probs  = self.anet(s)
+        dist = Categorical(action_probs)
+        action_log_probs = dist.log_prob(a)
+        ratio = torch.exp(action_log_probs - old_action_log_probs)
+        # ratio = torch.exp(action_log_probs - old_action_log_probs[index].detach())
 
-                (mu, sigma) = self.anet(s[index])
-                dist = Normal(mu, sigma)
-                action_log_probs = dist.log_prob(a[index])
-                ratio = torch.exp(action_log_probs - old_action_log_probs[index])
+        surr1 = ratio * adv
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_param,
+                            1.0 + self.clip_param) * adv
+        action_loss = -torch.min(surr1, surr2).mean()
 
-                surr1 = ratio * adv[index]
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_param,
-                                    1.0 + self.clip_param) * adv[index]
-                action_loss = -torch.min(surr1, surr2).mean()
+        self.optimizer_a.zero_grad()
+        action_loss.backward()
+        nn.utils.clip_grad_norm_(self.anet.parameters(), self.max_grad_norm)
+        self.optimizer_a.step()
 
-                self.optimizer_a.zero_grad()
-                action_loss.backward()
-                nn.utils.clip_grad_norm_(self.anet.parameters(), self.max_grad_norm)
-                self.optimizer_a.step()
-
-                value_loss = F.smooth_l1_loss(self.cnet(s[index]), target_v[index])
-                self.optimizer_c.zero_grad()
-                value_loss.backward()
-                nn.utils.clip_grad_norm_(self.cnet.parameters(), self.max_grad_norm)
-                self.optimizer_c.step()
+        value_loss = F.smooth_l1_loss(self.cnet(s), target_v)
+        self.optimizer_c.zero_grad()
+        value_loss.backward()
+        nn.utils.clip_grad_norm_(self.cnet.parameters(), self.max_grad_norm)
+        self.optimizer_c.step()
 
         del self.buffer[:]
 
+EPISODE = 3000  # total training episodes
+STEP = 5000  # step limitation in an episode
+EVAL_EVERY = 10  # evaluation interval
+TEST_NUM = 5  # number of tests every evaluation
 
 def main():
-    env = gym.make('Pendulum-v1', render_mode="human")
+    # env = gym.make('CartPole-v1', render_mode="human")
+    env = gym.make('CartPole-v1')
     # env.seed(args.seed)
-
+    num_state = env.observation_space.shape[0]
+    num_action = env.action_space.n
     agent = Agent()
 
     training_records = []
     running_reward = -1000
-    state = env.reset()
-    for i_ep in range(1000):
-        score = 0
+
+    for i_ep in range(EPISODE):
         state, info = env.reset()
 
-        for t in range(200):
+        for t in range(STEP):
             action, action_log_prob = agent.select_action(state)
-            state_, reward, done, truncated, info = env.step([action]) 
-            if args.render and running_reward > -700:
-                env.render()
-            if agent.store(Transition(state, action, action_log_prob, (reward + 8) / 8, state_)):
-            # if agent.store(Transition(state, action, action_log_prob, reward, state_)):
-                # print('update')
-                agent.update()
-            score += reward
+            state_, reward, done, truncated, info = env.step(action) 
+            agent.store(Transition(state, action, action_log_prob, reward, state_))
             state = state_
+            if args.render:
+                env.render()
+            if done:
+                agent.update()
+                break
 
-        running_reward = running_reward * 0.9 + score * 0.1
-        training_records.append(TrainingRecord(i_ep, running_reward))
-
-        if i_ep % args.log_interval == 0:
-            print('Ep {}\tMoving average score: {:.2f}\t'.format(i_ep, running_reward))
-        if running_reward > -200:
+        if i_ep % args.log_interval == 0 or i_ep >= EPISODE - 1:
+            total_reward = 0
+            for i in range(TEST_NUM):
+                state, info = env.reset()
+                for _ in range(STEP):
+                    action, _ = agent.select_action(state)
+                    state_, reward, done, truncated, info = env.step(action)
+                    total_reward += reward
+                    state = state_
+                    if done or truncated:
+                        break
+            score = total_reward / TEST_NUM
+            print('Ep {}\ttest score: {:.2f}\t'.format(i_ep, score))
+            training_records.append(TrainingRecord(i_ep, score))
+        if score > 470:
             print("Solved! Moving average score is now {}!".format(running_reward))
             env.close()
             agent.save_param()
